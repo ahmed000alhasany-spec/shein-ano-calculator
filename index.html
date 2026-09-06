@@ -23,7 +23,7 @@ body{
 .logo span{color:#ff5b9d}
 .subtitle{margin-top:7px;color:#ddd}
 .container{
-  max-width:600px;
+  max-width:650px;
   margin:25px auto;
   padding:0 16px;
 }
@@ -53,17 +53,10 @@ button{
   border:0;
   border-radius:12px;
   background:#000;
-  color:white;
+  color:#fff;
   font-size:17px;
   font-weight:700;
 }
-button:active{opacity:.8}
-.rate{
-  display:flex;
-  align-items:center;
-  gap:8px;
-}
-.rate input{margin:0}
 .badge{
   background:#fff0f6;
   color:#d72d75;
@@ -71,14 +64,34 @@ button:active{opacity:.8}
   border-radius:20px;
   font-size:13px;
   font-weight:bold;
+  display:inline-block;
 }
 .result{display:none}
+.product{
+  border-bottom:1px solid #eee;
+  padding:14px 0;
+}
+.product:last-child{border-bottom:0}
+.product-name{
+  font-weight:700;
+  line-height:1.5;
+}
+.product-meta{
+  margin-top:7px;
+  color:#666;
+  font-size:14px;
+}
+.product-iqd{
+  margin-top:6px;
+  font-weight:800;
+}
 .total{
   text-align:center;
   background:#000;
   color:#fff;
   border-radius:16px;
   padding:20px;
+  margin-top:18px;
 }
 .total small{color:#ccc}
 .total strong{
@@ -104,6 +117,7 @@ button:active{opacity:.8}
   padding:12px;
   border-radius:10px;
   margin-top:12px;
+  line-height:1.6;
 }
 </style>
 </head>
@@ -130,16 +144,11 @@ button:active{opacity:.8}
     >
 
     <label>سعر الصرف</label>
-    <div class="rate">
-      <input
-        id="exchange"
-        type="number"
-        value="1320"
-      >
-      <strong>د.ع</strong>
-    </div>
-
-    <br>
+    <input
+      id="exchange"
+      type="number"
+      value="1320"
+    >
 
     <button onclick="calculateCart()">
       احسب السلة
@@ -153,75 +162,125 @@ button:active{opacity:.8}
   </div>
 
   <div id="result" class="card result">
+    <div id="products"></div>
+
     <div class="total">
-      <small>المجموع التقريبي</small>
+      <small>المجموع النهائي بالعراقي</small>
       <strong id="totalIQD">0 د.ع</strong>
     </div>
   </div>
 
   <div class="note">
-    SHEIN Ano<br>
-    ستور الإمارات 🇦🇪<br>
-    سعر الصرف قابل للتغيير
+    الأسعار تعتمد على السعر العام والعروض الظاهرة بدون تسجيل دخول.<br>
+    لا يتم احتساب الكوبونات أو النقاط أو خصومات الحساب.
   </div>
 
 </div>
 
 <script>
-async function calculateCart(){
+async function calculateCart() {
+  const url = document.getElementById("cartUrl").value.trim();
+  const rate = Number(document.getElementById("exchange").value);
 
-  const url =
-    document.getElementById("cartUrl").value.trim();
+  const error = document.getElementById("error");
+  const loader = document.getElementById("loader");
+  const result = document.getElementById("result");
+  const productsBox = document.getElementById("products");
 
-  const rate =
-    Number(document.getElementById("exchange").value);
+  error.style.display = "none";
+  result.style.display = "none";
+  productsBox.innerHTML = "";
 
-  const error =
-    document.getElementById("error");
-
-  const loader =
-    document.getElementById("loader");
-
-  const result =
-    document.getElementById("result");
-
-  error.style.display="none";
-  result.style.display="none";
-
-  if(!url){
-    error.innerText="الصق رابط سلة SHEIN أولاً";
-    error.style.display="block";
+  if (!url) {
+    showError("الصق رابط سلة SHEIN أولاً.");
     return;
   }
 
-  if(!url.includes("shein.com")){
-    error.innerText="هذا مو رابط SHEIN";
-    error.style.display="block";
+  if (!rate || rate <= 0) {
+    showError("اكتب سعر صرف صحيح.");
     return;
   }
 
-  if(!rate || rate <= 0){
-    error.innerText="اكتب سعر صرف صحيح";
-    error.style.display="block";
-    return;
+  loader.style.display = "block";
+
+  try {
+    const response = await fetch("/api/cart", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ url })
+    });
+
+    const data = await response.json();
+
+    if (!response.ok || !data.ok) {
+      throw new Error(
+        data.error || "تعذر قراءة السلة."
+      );
+    }
+
+    if (!data.products || !data.products.length) {
+      throw new Error("ما حصلنا منتجات داخل الرابط.");
+    }
+
+    let totalIQD = 0;
+
+    data.products.forEach(product => {
+      const qty = Number(product.quantity || 1);
+      const aed = Number(product.priceAED || 0);
+
+      // حالياً نحول قيمة السعر اللي يرجعها السيرفر مباشرة
+      // حسب سعر الصرف اللي يكتبه المستخدم.
+      const iqd = aed * rate * qty;
+      totalIQD += iqd;
+
+      const div = document.createElement("div");
+      div.className = "product";
+
+      div.innerHTML = `
+        <div class="product-name">
+          ${escapeHtml(product.name)}
+        </div>
+
+        <div class="product-meta">
+          السعر: ${aed.toFixed(2)} |
+          الكمية: ${qty}
+        </div>
+
+        <div class="product-iqd">
+          ${Math.round(iqd).toLocaleString("en-US")} د.ع
+        </div>
+      `;
+
+      productsBox.appendChild(div);
+    });
+
+    document.getElementById("totalIQD").innerText =
+      Math.round(totalIQD).toLocaleString("en-US") + " د.ع";
+
+    result.style.display = "block";
+
+  } catch (err) {
+    showError(err.message);
+  } finally {
+    loader.style.display = "none";
   }
+}
 
-  loader.style.display="block";
+function showError(message) {
+  const error = document.getElementById("error");
+  error.innerText = message;
+  error.style.display = "block";
+}
 
-  /*
-    بالخطوة الجاية نربط هذا المكان
-    بالسيرفر حتى يقرأ أسعار سلة
-    SHEIN الإمارات تلقائياً.
-  */
-
-  setTimeout(function(){
-    loader.style.display="none";
-
-    error.innerText=
-      "واجهة الحاسبة جاهزة ✅ باقي ربط قراءة سلة SHEIN.";
-    error.style.display="block";
-
-  },700);
+function escapeHtml(text) {
+  return String(text)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 </script>
 
