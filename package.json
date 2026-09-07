@@ -1,9 +1,14 @@
 {
-  "name": "shein-ano-calculator",
+  "name": "shein-ano-cart",
   "version": "1.0.0",
-  "type": "module",
+  "private": true,
+  "description": "SHEIN Ano cart calculator",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "dependencies": {
     "express": "^5.1.0"
