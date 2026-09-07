@@ -7,13 +7,11 @@ const app = express();
 app.use(express.json({ limit: "100kb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
-const RATE = 1320;
 const AED_PER_USD = 3.6725;
-
-let browserPromise = null;
 const cache = new Map();
+let browserPromise = null;
 
-function browser() {
+function getBrowser() {
   if (!browserPromise) {
     browserPromise = chromium.launch({
       headless: true,
@@ -48,394 +46,317 @@ function clean(s) {
 
 function toNum(v) {
   if (v == null) return null;
-  if (typeof v === "number") return Number.isFinite(v) ? v : null;
-  if (typeof v === "object") {
-    for (const k of ["amount","value","salePrice","sale_price","retailPrice","retail_price","price","unitPrice","unit_price"]) {
-      if (Object.prototype.hasOwnProperty.call(v, k)) {
-        const n = toNum(v[k]);
-        if (n != null) return n;
-      }
-    }
-    return null;
-  }
   const s = String(v).replace(/,/g, "").replace(/[^\d.]/g, "");
   const n = Number(s);
-  return Number.isFinite(n) ? n : null;
+  return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-function pick(obj, keys) {
-  for (const k of keys) {
-    if (obj && obj[k] != null && obj[k] !== "") return obj[k];
-  }
-  return null;
+function aedToUsd(aed) {
+  return Number(aed) / AED_PER_USD;
 }
 
-function normImage(v) {
-  if (!v) return "";
-  if (typeof v === "object") v = pick(v, ["url","src","original","medium","large"]);
-  if (typeof v !== "string") return "";
-  v = v.replace(/\\\//g, "/");
-  if (v.startsWith("//")) v = "https:" + v;
-  return v;
-}
+async function resolveSharePage(page, startUrl) {
+  const seen = new Set();
+  let shareCandidate = "";
 
-function normalizeCandidate(obj, context = "") {
-  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
-
-  const name = pick(obj, [
-    "goods_name","goodsName","product_name","productName",
-    "product_title","productTitle","name","title"
-  ]);
-
-  const qtyRaw = pick(obj, [
-    "quantity","qty","goods_num","goodsNum","count","num"
-  ]);
-
-  const qty = toNum(qtyRaw);
-
-  let priceRaw = pick(obj, [
-    "salePrice","sale_price","retailPrice","retail_price",
-    "unitPrice","unit_price","price","mallPrice","amount"
-  ]);
-
-  let price = toNum(priceRaw);
-
-  if (!price) {
-    for (const k of ["priceInfo","price_info","salePrice","retailPrice","price"]) {
-      if (obj[k] && typeof obj[k] === "object") {
-        price = toNum(obj[k]);
-        if (price) break;
-      }
+  page.on("request", req => {
+    const u = req.url();
+    if (u.includes("/share/cart/")) {
+      seen.add(u);
+      shareCandidate = u;
     }
+  });
+
+  page.on("response", resp => {
+    const u = resp.url();
+    if (u.includes("/share/cart/")) {
+      seen.add(u);
+      shareCandidate = u;
+    }
+  });
+
+  await page.goto(startUrl, {
+    waitUntil: "domcontentloaded",
+    timeout: 35000
+  });
+
+  await page.waitForTimeout(5000);
+
+  if (!shareCandidate) {
+    shareCandidate = await page.evaluate(() => {
+      const links = [...document.querySelectorAll("a[href]")].map(a => a.href);
+      return links.find(h => h.includes("/share/cart/")) || "";
+    }).catch(() => "");
   }
 
-  if (!name || !price) return null;
-
-  let img = pick(obj, [
-    "goods_img","goodsImg","productImage","product_image",
-    "mainImage","main_image","image","img","thumbnail"
-  ]);
-
-  const id = String(pick(obj, [
-    "goods_id","goodsId","product_id","productId",
-    "sku","sku_code","id"
-  ]) || "");
-
-  const variant = clean(
-    [
-      pick(obj, ["sku_name","skuName","variant"]),
-      pick(obj, ["size"]),
-      pick(obj, ["color"])
-    ].filter(Boolean).join(" / ")
-  );
-
-  const lc = context.toLowerCase();
-  const cartish =
-    /cart|bag|checkout|goodslist|goods_list|cartlist|cart_list|shopping/i.test(lc) ||
-    qty != null;
+  // بعض روابط OneLink تبقى بصفحة وسيطة؛ إذا لقينا رابط السلة الحقيقي نفتحه مباشرة.
+  if (shareCandidate && page.url() !== shareCandidate) {
+    await page.goto(shareCandidate, {
+      waitUntil: "domcontentloaded",
+      timeout: 35000
+    }).catch(() => {});
+    await page.waitForTimeout(5000);
+  }
 
   return {
-    id,
-    name: clean(name),
-    qty: Math.max(1, Math.round(qty || 1)),
-    price,
-    img: normImage(img),
-    variant,
-    cartish
+    finalUrl: page.url(),
+    shareUrl: shareCandidate || ""
   };
 }
 
-function walk(value, pathStr, found, depth = 0) {
-  if (depth > 18 || value == null) return;
+async function extractExpectedCount(page) {
+  return await page.evaluate(() => {
+    const t = (document.body?.innerText || "").replace(/\s+/g, " ");
 
-  if (Array.isArray(value)) {
-    for (let i = 0; i < value.length; i++) {
-      walk(value[i], `${pathStr}[${i}]`, found, depth + 1);
+    const pats = [
+      /كل المنتجات\s*\((\d{1,3})\)/i,
+      /All\s*\((\d{1,3})\)/i,
+      /(?:السلة|عربة التسوق|cart|bag)[^0-9]{0,40}(\d{1,3})\s*(?:قطعة|منتج|items?)/i,
+      /(\d{1,3})\s*(?:قطعة|منتج|items?)[^0-9]{0,40}(?:السلة|cart|bag)/i
+    ];
+
+    for (const re of pats) {
+      const m = t.match(re);
+      if (m) {
+        const n = Number(m[1]);
+        if (n > 0 && n <= 200) return n;
+      }
     }
-    return;
+    return null;
+  }).catch(() => null);
+}
+
+async function extractCartCards(page, expectedCount) {
+  return await page.evaluate((expectedCount) => {
+    const txt = el => (el?.innerText || "").replace(/\s+/g, " ").trim();
+
+    function getPrice(text) {
+      const t = String(text || "").replace(/,/g, "");
+      const patterns = [
+        /(?:AED|د\.?\s*إ|دإ)\s*([0-9]+(?:\.[0-9]{1,2})?)/i,
+        /([0-9]+(?:\.[0-9]{1,2})?)\s*(?:AED|د\.?\s*إ|دإ)/i
+      ];
+      for (const re of patterns) {
+        const m = t.match(re);
+        if (m) return Number(m[1]);
+      }
+      return null;
+    }
+
+    function imageOf(el) {
+      const img = el?.querySelector("img");
+      return img?.currentSrc || img?.src || img?.getAttribute("data-src") || img?.getAttribute("data-original") || "";
+    }
+
+    function quantityOf(el) {
+      const t = txt(el);
+      let m = t.match(/[−-]\s*(\d{1,2})\s*\+/);
+      if (m) return Math.max(1, Number(m[1]));
+      m = t.match(/\+\s*(\d{1,2})\s*[−-]/);
+      if (m) return Math.max(1, Number(m[1]));
+      return 1;
+    }
+
+    function nameOf(el, a) {
+      const lines = (el?.innerText || "")
+        .split("\n")
+        .map(s => s.replace(/\s+/g, " ").trim())
+        .filter(Boolean);
+
+      const bad = /^(AED|د\.?\s*إ|دإ)?\s*\d+(?:\.\d+)?\s*(AED|د\.?\s*إ|دإ)?$/i;
+
+      const n = lines.find(line =>
+        line.length >= 5 &&
+        line.length <= 240 &&
+        !bad.test(line) &&
+        !/^(qty|quantity|الكمية|حذف|remove|delete|خصم|عرض|شحن|shipping|save|حدد|اختيار)/i.test(line)
+      );
+
+      return n || (a?.textContent || "").trim() || "منتج SHEIN";
+    }
+
+    const allProductLinks = [...document.querySelectorAll('a[href*="goods-p-"], a[href*="/goods-p-"]')];
+    const found = [];
+
+    for (const a of allProductLinks) {
+      let el = a;
+      let chosen = null;
+
+      // نصعد للأب ونبحث عن أصغر كرت فيه السعر/الصورة أو تحكم كمية.
+      for (let i = 0; i < 8 && el; i++, el = el.parentElement) {
+        const text = txt(el);
+        const buttons = [...el.querySelectorAll("button")].map(b => txt(b));
+        const hasPlus = buttons.some(x => x.includes("+"));
+        const hasMinus = buttons.some(x => x.includes("-") || x.includes("−"));
+        const hasQty = hasPlus && hasMinus;
+        const price = getPrice(text);
+        const img = imageOf(el);
+
+        if (
+          text.length >= 8 &&
+          text.length <= 1400 &&
+          (hasQty || price) &&
+          img &&
+          el.querySelectorAll('a[href*="goods-p-"]').length <= 3
+        ) {
+          chosen = { el, price, img, hasQty };
+          if (hasQty) break;
+        }
+      }
+
+      if (!chosen) continue;
+
+      const href = a.href;
+      const m = href.match(/goods-p-(\d+)/i);
+      const goodsId = m ? m[1] : href;
+
+      found.push({
+        goodsId,
+        href,
+        name: nameOf(chosen.el, a),
+        aed: chosen.price,
+        qty: quantityOf(chosen.el),
+        img: chosen.img,
+        score: chosen.hasQty ? 10 : 4
+      });
+    }
+
+    // إزالة التكرار مع تفضيل الكرت اللي عنده تحكم كمية.
+    const best = new Map();
+    for (const p of found) {
+      const prev = best.get(p.goodsId);
+      if (!prev || p.score > prev.score) best.set(p.goodsId, p);
+    }
+
+    let arr = [...best.values()].sort((a,b) => b.score - a.score);
+
+    // إذا عرفنا عدد السلة، نلتزم بيه حتى ما نجيب المقترحات.
+    if (expectedCount && arr.length > expectedCount) {
+      arr = arr.slice(0, expectedCount);
+    }
+
+    return arr;
+  }, expectedCount).catch(() => []);
+}
+
+async function enrichFromProductPage(context, p) {
+  // إذا الكرت نفسه بيه اسم + سعر + صورة، ما نحتاج فتح صفحة المنتج.
+  if (p.aed && p.img && p.name && p.name !== "منتج SHEIN") return p;
+
+  const page = await context.newPage();
+  try {
+    await page.goto(p.href, {
+      waitUntil: "domcontentloaded",
+      timeout: 25000
+    });
+    await page.waitForTimeout(1800);
+
+    const info = await page.evaluate(() => {
+      const body = (document.body?.innerText || "").replace(/\s+/g, " ");
+
+      const title =
+        document.querySelector("h1")?.textContent?.trim() ||
+        document.querySelector('meta[property="og:title"]')?.content ||
+        document.title ||
+        "";
+
+      const img =
+        document.querySelector('meta[property="og:image"]')?.content ||
+        document.querySelector("img")?.currentSrc ||
+        document.querySelector("img")?.src ||
+        "";
+
+      let price = null;
+      const pats = [
+        /(?:AED|د\.?\s*إ|دإ)\s*([0-9]+(?:\.[0-9]{1,2})?)/i,
+        /([0-9]+(?:\.[0-9]{1,2})?)\s*(?:AED|د\.?\s*إ|دإ)/i
+      ];
+      for (const re of pats) {
+        const m = body.match(re);
+        if (m) {
+          price = Number(m[1]);
+          break;
+        }
+      }
+
+      return { title, img, price };
+    });
+
+    return {
+      ...p,
+      name: p.name && p.name !== "منتج SHEIN" ? p.name : clean(info.title),
+      img: p.img || info.img || "",
+      aed: p.aed || info.price || null
+    };
+  } catch {
+    return p;
+  } finally {
+    await page.close().catch(() => {});
   }
-
-  if (typeof value !== "object") return;
-
-  const c = normalizeCandidate(value, pathStr);
-  if (c) found.push({ ...c, sourcePath: pathStr });
-
-  for (const [k, v] of Object.entries(value)) {
-    walk(v, `${pathStr}.${k}`, found, depth + 1);
-  }
 }
 
-function score(c) {
-  let s = 0;
-  const p = (c.sourcePath || "").toLowerCase();
+async function scrapeCart(startUrl) {
+  const b = await getBrowser();
 
-  if (c.cartish) s += 5;
-  if (/cart|bag|checkout/.test(p)) s += 8;
-  if (/goodslist|goods_list|cartlist|cart_list|items|products/.test(p)) s += 4;
-  if (c.qty >= 1 && c.qty <= 50) s += 3;
-  if (c.img) s += 2;
-  if (c.id) s += 2;
-
-  const n = c.name.toLowerCase();
-  if (/coupon|discount|shipping|subtotal|total|recommend|you may also like|خصم|شحن|المجموع|موصى/.test(n)) s -= 10;
-
-  return s;
-}
-
-function dedupeCandidates(arr) {
-  const best = new Map();
-
-  for (const c of arr) {
-    if (!c.name || !c.price || c.price <= 0 || c.price > 5000) continue;
-
-    const key = c.id || `${c.name}|${c.price}|${c.variant}`;
-
-    const prev = best.get(key);
-    if (!prev || score(c) > score(prev)) best.set(key, c);
-  }
-
-  return [...best.values()].sort((a,b) => score(b) - score(a));
-}
-
-function priceToUsd(price, currencyHint) {
-  // UAE store: if currency is AED or unknown from UAE page, convert AED -> USD.
-  if (currencyHint === "USD") return price;
-  return price / AED_PER_USD;
-}
-
-async function scrape(startUrl) {
-  const b = await browser();
-
+  // Desktop UA حتى OneLink ما يحاول يفتح التطبيق بدل صفحة الويب.
   const context = await b.newContext({
-    locale: "ar-AE",
+    locale: "en-AE",
     timezoneId: "Asia/Dubai",
-    viewport: { width: 390, height: 844 },
+    viewport: { width: 1365, height: 900 },
     userAgent:
-      "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) " +
-      "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 " +
-      "Mobile/15E148 Safari/604.1",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+      "AppleWebKit/537.36 (KHTML, like Gecko) " +
+      "Chrome/140.0.0.0 Safari/537.36",
     extraHTTPHeaders: {
-      "Accept-Language": "ar-AE,ar;q=0.9,en;q=0.8"
+      "Accept-Language": "en-AE,en;q=0.9,ar;q=0.8"
     }
   });
 
   const page = await context.newPage();
-  const networkCandidates = [];
-  const seenResponseUrls = new Set();
-
-  page.on("response", async (resp) => {
-    try {
-      const req = resp.request();
-      const type = req.resourceType();
-      if (!["xhr","fetch"].includes(type)) return;
-
-      const url = resp.url();
-      const lower = url.toLowerCase();
-
-      if (!/(cart|bag|checkout|goods|product|share|api)/.test(lower)) return;
-      if (seenResponseUrls.has(url)) return;
-      seenResponseUrls.add(url);
-
-      const ct = (resp.headers()["content-type"] || "").toLowerCase();
-      if (!ct.includes("json")) return;
-
-      const data = await resp.json().catch(() => null);
-      if (!data) return;
-
-      const tmp = [];
-      walk(data, `response:${url}`, tmp);
-      networkCandidates.push(...tmp);
-    } catch {}
-  });
 
   try {
-    await page.goto(startUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: 35000
-    });
+    const resolved = await resolveSharePage(page, startUrl);
 
-    await page.waitForTimeout(9000);
-
-    // Let lazy-loaded cart data settle but avoid scrolling to recommendation sections.
+    // نحرك الصفحة شوي حتى تتحمل كروت السلة.
     await page.evaluate(async () => {
       window.scrollTo(0, 0);
       await new Promise(r => setTimeout(r, 500));
-      window.scrollBy(0, 500);
+      window.scrollBy(0, 550);
       await new Promise(r => setTimeout(r, 700));
       window.scrollTo(0, 0);
     }).catch(() => {});
 
-    await page.waitForTimeout(2500);
+    await page.waitForTimeout(1500);
 
-    // Pull state blobs from the page too.
-    const stateObjects = await page.evaluate(() => {
-      const out = [];
-      const names = [
-        "__NEXT_DATA__",
-        "__INITIAL_STATE__",
-        "gbRawData",
-        "__NUXT__",
-        "__APOLLO_STATE__"
-      ];
+    const expectedCount = await extractExpectedCount(page);
+    let cards = await extractCartCards(page, expectedCount);
 
-      for (const n of names) {
-        try {
-          if (window[n]) out.push({ name:n, value:window[n] });
-        } catch {}
-      }
-
-      for (const s of document.scripts) {
-        try {
-          const t = (s.textContent || "").trim();
-          if (!t) continue;
-
-          if (s.type === "application/json" || s.type === "application/ld+json") {
-            out.push({ name:"script-json", value:JSON.parse(t) });
-          }
-        } catch {}
-      }
-
-      return out;
-    }).catch(() => []);
-
-    const stateCandidates = [];
-    for (const x of stateObjects) {
-      walk(x.value, `page:${x.name}`, stateCandidates);
+    // إذا عدد السلة معروف، لا نسمح بأكثر منه أبداً.
+    if (expectedCount && cards.length > expectedCount) {
+      cards = cards.slice(0, expectedCount);
     }
 
-    // DOM fallback: focus on blocks with quantity controls and a single product image.
-    const domProducts = await page.evaluate(() => {
-      const txt = el => (el?.innerText || "").replace(/\s+/g, " ").trim();
-
-      function getImg(el) {
-        const i = el?.querySelector("img");
-        return i?.currentSrc || i?.src || i?.getAttribute("data-src") || "";
-      }
-
-      function hasQty(el) {
-        const buttons = [...el.querySelectorAll("button")].map(b => txt(b));
-        const hasP = buttons.some(x => x.includes("+"));
-        const hasM = buttons.some(x => x.includes("-") || x.includes("−"));
-        return hasP && hasM;
-      }
-
-      function money(text) {
-        const t = text.replace(/,/g, "");
-        let m = t.match(/(?:AED|د\.?\s*إ|دإ)\s*([0-9]+(?:\.[0-9]{1,2})?)/i);
-        if (m) return Number(m[1]);
-
-        m = t.match(/([0-9]+(?:\.[0-9]{1,2})?)\s*(?:AED|د\.?\s*إ|دإ)/i);
-        if (m) return Number(m[1]);
-
-        return null;
-      }
-
-      const qNodes = [...document.querySelectorAll("body *")].filter(hasQty);
-      const cards = [];
-
-      for (const q of qNodes) {
-        let el = q;
-        for (let i = 0; i < 6 && el; i++, el = el.parentElement) {
-          const text = txt(el);
-          const img = getImg(el);
-          const price = money(text);
-
-          if (
-            img &&
-            price &&
-            text.length >= 10 &&
-            text.length <= 1000 &&
-            el.querySelectorAll("img").length <= 3
-          ) {
-            const lines = (el.innerText || "")
-              .split("\n")
-              .map(x => x.replace(/\s+/g," ").trim())
-              .filter(Boolean);
-
-            const name = lines.find(line =>
-              line.length >= 5 &&
-              line.length <= 220 &&
-              !/^(AED|د\.?\s*إ|دإ)?\s*\d/.test(line) &&
-              !/^(qty|quantity|الكمية|حذف|remove|delete|خصم|عرض|shipping|شحن)/i.test(line)
-            );
-
-            if (name) cards.push({ name, price, img });
-            break;
-          }
-        }
-      }
-
-      const seen = new Set();
-      return cards.filter(p => {
-        const k = `${p.name}|${p.price}|${p.img}`;
-        if (seen.has(k)) return false;
-        seen.add(k);
-        return true;
-      });
-    }).catch(() => []);
-
-    let candidates = dedupeCandidates([
-      ...networkCandidates,
-      ...stateCandidates
-    ]);
-
-    // Prefer only candidates strongly tied to cart structures.
-    let strong = candidates.filter(c => score(c) >= 8);
-
-    // If network/state gave nothing reliable, use DOM fallback.
-    let finalProducts = strong.length ? strong : domProducts.map(p => ({
-      name:p.name,
-      price:p.price,
-      qty:1,
-      img:p.img,
-      variant:"",
-      sourcePath:"dom",
-      cartish:true
-    }));
-
-    // Detect count from page text; user's test cart has 2 items, this keeps extras out.
-    const detectedCount = await page.evaluate(() => {
-      const t = (document.body?.innerText || "").replace(/\s+/g," ");
-
-      const patterns = [
-        /(?:السلة|cart|bag)[^0-9]{0,30}([0-9]{1,2})\s*(?:قطعة|منتج|items?)/i,
-        /([0-9]{1,2})\s*(?:قطعة|منتج|items?)[^0-9]{0,30}(?:السلة|cart|bag)/i
-      ];
-
-      for (const re of patterns) {
-        const m = t.match(re);
-        if (m) {
-          const n = Number(m[1]);
-          if (n >= 1 && n <= 100) return n;
-        }
-      }
-
-      return null;
-    }).catch(() => null);
-
-    if (detectedCount && finalProducts.length > detectedCount) {
-      finalProducts = finalProducts.slice(0, detectedCount);
+    // افتح صفحات المنتجات فقط عند الحاجة، وبحد أقصى 25 قطعة.
+    const enriched = [];
+    for (const p of cards.slice(0, 25)) {
+      enriched.push(await enrichFromProductPage(context, p));
     }
 
-    // Last safeguard: keep only the top cart-like items if there are obvious recommendation floods.
-    if (!detectedCount && finalProducts.length > 8) {
-      finalProducts = finalProducts.slice(0, 8);
-    }
-
-    const products = finalProducts
-      .filter(p => p.name && p.price > 0.5 && p.price < 5000)
+    const products = enriched
+      .filter(p => p && p.name && p.aed && Number(p.aed) > 0.5 && Number(p.aed) < 5000)
       .map(p => ({
         name: clean(p.name),
-        usd: priceToUsd(Number(p.price), "AED"),
-        aed: Number(p.price),
+        usd: aedToUsd(Number(p.aed)),
+        aed: Number(p.aed),
         qty: Math.max(1, Number(p.qty) || 1),
         img: p.img || "",
-        variant: p.variant || ""
+        variant: ""
       }));
 
     return {
-      url: page.url(),
-      detectedCount,
+      url: resolved.finalUrl,
+      shareUrl: resolved.shareUrl,
+      expectedCount,
       products
     };
   } finally {
@@ -458,47 +379,49 @@ app.post("/api/cart", async (req, res) => {
       return res.json(cached.data);
     }
 
-    const result = await scrape(url);
+    const result = await scrapeCart(url);
 
     if (!result.products.length) {
       return res.status(422).json({
         error:
-          "فتحنا رابط السلة، بس SHEIN ما رجّع بيانات منتجات كافية. جرّبي نفس الرابط مرة ثانية."
+          "فتحنا الرابط بس بعد ما ظهرت كروت المنتجات. جرّبي رابط مشاركة جديد من داخل السلة، وإذا استمرت راح نحتاج نقرأ رابط /share/cart المباشر بدل OneLink."
       });
     }
 
     const data = {
-      url: result.url,
-      detectedCount: result.detectedCount,
+      url: result.shareUrl || result.url,
+      detectedCount: result.expectedCount,
       products: result.products
     };
 
     cache.set(url, { time: Date.now(), data });
-    res.json(data);
+    return res.json(data);
   } catch (err) {
-    console.error(err);
+    console.error("scrape error:", err);
 
-    const m = String(err?.message || "");
+    const msg = String(err?.message || "");
 
-    if (m.includes("Executable doesn't exist")) {
+    if (msg.includes("Executable doesn't exist")) {
       return res.status(500).json({
         error: "Chromium مو مضبوط على Render."
       });
     }
 
-    if (m.includes("Timeout")) {
+    if (msg.includes("Timeout")) {
       return res.status(504).json({
         error: "SHEIN أخذ وقت أطول من اللازم. جرّبي مرة ثانية."
       });
     }
 
-    res.status(500).json({
+    return res.status(500).json({
       error: "صار خطأ أثناء قراءة السلة."
     });
   }
 });
 
-app.get("/health", (req,res) => res.json({ ok:true }));
+app.get("/health", (req, res) => res.json({ ok: true }));
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log("SHEIN Ano cart reader v3 running on", port));
+app.listen(port, () => {
+  console.log("SHEIN Ano direct share/cart reader v4 running on", port);
+});
