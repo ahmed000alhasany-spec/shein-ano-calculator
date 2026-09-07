@@ -7,11 +7,13 @@ const app = express();
 app.use(express.json({ limit: "100kb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
+const RATE = 1320;
 const AED_PER_USD = 3.6725;
-const cache = new Map();
-let browserPromise = null;
 
-function getBrowser() {
+let browserPromise = null;
+const cache = new Map();
+
+function browser() {
   if (!browserPromise) {
     browserPromise = chromium.launch({
       headless: true,
@@ -40,18 +42,171 @@ function allowed(url) {
   }
 }
 
-function aedToUsd(aed) {
-  return Number(aed) / AED_PER_USD;
-}
-
-function cleanText(s) {
+function clean(s) {
   return String(s || "").replace(/\s+/g, " ").trim();
 }
 
-async function scrapeCart(startUrl) {
-  const browser = await getBrowser();
+function toNum(v) {
+  if (v == null) return null;
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  if (typeof v === "object") {
+    for (const k of ["amount","value","salePrice","sale_price","retailPrice","retail_price","price","unitPrice","unit_price"]) {
+      if (Object.prototype.hasOwnProperty.call(v, k)) {
+        const n = toNum(v[k]);
+        if (n != null) return n;
+      }
+    }
+    return null;
+  }
+  const s = String(v).replace(/,/g, "").replace(/[^\d.]/g, "");
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
 
-  const context = await browser.newContext({
+function pick(obj, keys) {
+  for (const k of keys) {
+    if (obj && obj[k] != null && obj[k] !== "") return obj[k];
+  }
+  return null;
+}
+
+function normImage(v) {
+  if (!v) return "";
+  if (typeof v === "object") v = pick(v, ["url","src","original","medium","large"]);
+  if (typeof v !== "string") return "";
+  v = v.replace(/\\\//g, "/");
+  if (v.startsWith("//")) v = "https:" + v;
+  return v;
+}
+
+function normalizeCandidate(obj, context = "") {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
+
+  const name = pick(obj, [
+    "goods_name","goodsName","product_name","productName",
+    "product_title","productTitle","name","title"
+  ]);
+
+  const qtyRaw = pick(obj, [
+    "quantity","qty","goods_num","goodsNum","count","num"
+  ]);
+
+  const qty = toNum(qtyRaw);
+
+  let priceRaw = pick(obj, [
+    "salePrice","sale_price","retailPrice","retail_price",
+    "unitPrice","unit_price","price","mallPrice","amount"
+  ]);
+
+  let price = toNum(priceRaw);
+
+  if (!price) {
+    for (const k of ["priceInfo","price_info","salePrice","retailPrice","price"]) {
+      if (obj[k] && typeof obj[k] === "object") {
+        price = toNum(obj[k]);
+        if (price) break;
+      }
+    }
+  }
+
+  if (!name || !price) return null;
+
+  let img = pick(obj, [
+    "goods_img","goodsImg","productImage","product_image",
+    "mainImage","main_image","image","img","thumbnail"
+  ]);
+
+  const id = String(pick(obj, [
+    "goods_id","goodsId","product_id","productId",
+    "sku","sku_code","id"
+  ]) || "");
+
+  const variant = clean(
+    [
+      pick(obj, ["sku_name","skuName","variant"]),
+      pick(obj, ["size"]),
+      pick(obj, ["color"])
+    ].filter(Boolean).join(" / ")
+  );
+
+  const lc = context.toLowerCase();
+  const cartish =
+    /cart|bag|checkout|goodslist|goods_list|cartlist|cart_list|shopping/i.test(lc) ||
+    qty != null;
+
+  return {
+    id,
+    name: clean(name),
+    qty: Math.max(1, Math.round(qty || 1)),
+    price,
+    img: normImage(img),
+    variant,
+    cartish
+  };
+}
+
+function walk(value, pathStr, found, depth = 0) {
+  if (depth > 18 || value == null) return;
+
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      walk(value[i], `${pathStr}[${i}]`, found, depth + 1);
+    }
+    return;
+  }
+
+  if (typeof value !== "object") return;
+
+  const c = normalizeCandidate(value, pathStr);
+  if (c) found.push({ ...c, sourcePath: pathStr });
+
+  for (const [k, v] of Object.entries(value)) {
+    walk(v, `${pathStr}.${k}`, found, depth + 1);
+  }
+}
+
+function score(c) {
+  let s = 0;
+  const p = (c.sourcePath || "").toLowerCase();
+
+  if (c.cartish) s += 5;
+  if (/cart|bag|checkout/.test(p)) s += 8;
+  if (/goodslist|goods_list|cartlist|cart_list|items|products/.test(p)) s += 4;
+  if (c.qty >= 1 && c.qty <= 50) s += 3;
+  if (c.img) s += 2;
+  if (c.id) s += 2;
+
+  const n = c.name.toLowerCase();
+  if (/coupon|discount|shipping|subtotal|total|recommend|you may also like|خصم|شحن|المجموع|موصى/.test(n)) s -= 10;
+
+  return s;
+}
+
+function dedupeCandidates(arr) {
+  const best = new Map();
+
+  for (const c of arr) {
+    if (!c.name || !c.price || c.price <= 0 || c.price > 5000) continue;
+
+    const key = c.id || `${c.name}|${c.price}|${c.variant}`;
+
+    const prev = best.get(key);
+    if (!prev || score(c) > score(prev)) best.set(key, c);
+  }
+
+  return [...best.values()].sort((a,b) => score(b) - score(a));
+}
+
+function priceToUsd(price, currencyHint) {
+  // UAE store: if currency is AED or unknown from UAE page, convert AED -> USD.
+  if (currencyHint === "USD") return price;
+  return price / AED_PER_USD;
+}
+
+async function scrape(startUrl) {
+  const b = await browser();
+
+  const context = await b.newContext({
     locale: "ar-AE",
     timezoneId: "Asia/Dubai",
     viewport: { width: 390, height: 844 },
@@ -65,6 +220,33 @@ async function scrapeCart(startUrl) {
   });
 
   const page = await context.newPage();
+  const networkCandidates = [];
+  const seenResponseUrls = new Set();
+
+  page.on("response", async (resp) => {
+    try {
+      const req = resp.request();
+      const type = req.resourceType();
+      if (!["xhr","fetch"].includes(type)) return;
+
+      const url = resp.url();
+      const lower = url.toLowerCase();
+
+      if (!/(cart|bag|checkout|goods|product|share|api)/.test(lower)) return;
+      if (seenResponseUrls.has(url)) return;
+      seenResponseUrls.add(url);
+
+      const ct = (resp.headers()["content-type"] || "").toLowerCase();
+      if (!ct.includes("json")) return;
+
+      const data = await resp.json().catch(() => null);
+      if (!data) return;
+
+      const tmp = [];
+      walk(data, `response:${url}`, tmp);
+      networkCandidates.push(...tmp);
+    } catch {}
+  });
 
   try {
     await page.goto(startUrl, {
@@ -72,209 +254,188 @@ async function scrapeCart(startUrl) {
       timeout: 35000
     });
 
-    await page.waitForTimeout(7000);
+    await page.waitForTimeout(9000);
 
-    // نخلي العناصر المؤجلة تتحمل، بس بدون ما نوصل لقسم الاقتراحات أسفل الصفحة.
+    // Let lazy-loaded cart data settle but avoid scrolling to recommendation sections.
     await page.evaluate(async () => {
       window.scrollTo(0, 0);
-      for (let i = 0; i < 3; i++) {
-        window.scrollBy(0, Math.max(350, window.innerHeight * 0.55));
-        await new Promise(r => setTimeout(r, 500));
-      }
+      await new Promise(r => setTimeout(r, 500));
+      window.scrollBy(0, 500);
+      await new Promise(r => setTimeout(r, 700));
       window.scrollTo(0, 0);
     }).catch(() => {});
 
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(2500);
 
-    const raw = await page.evaluate(() => {
-      function txt(el) {
-        return (el?.innerText || "").replace(/\s+/g, " ").trim();
+    // Pull state blobs from the page too.
+    const stateObjects = await page.evaluate(() => {
+      const out = [];
+      const names = [
+        "__NEXT_DATA__",
+        "__INITIAL_STATE__",
+        "gbRawData",
+        "__NUXT__",
+        "__APOLLO_STATE__"
+      ];
+
+      for (const n of names) {
+        try {
+          if (window[n]) out.push({ name:n, value:window[n] });
+        } catch {}
       }
 
-      function getImage(el) {
-        const img = el?.querySelector("img");
-        return (
-          img?.currentSrc ||
-          img?.src ||
-          img?.getAttribute("data-src") ||
-          img?.getAttribute("data-original") ||
-          ""
-        );
+      for (const s of document.scripts) {
+        try {
+          const t = (s.textContent || "").trim();
+          if (!t) continue;
+
+          if (s.type === "application/json" || s.type === "application/ld+json") {
+            out.push({ name:"script-json", value:JSON.parse(t) });
+          }
+        } catch {}
       }
 
-      function parseMoney(text) {
-        const t = String(text || "").replace(/,/g, "");
+      return out;
+    }).catch(() => []);
 
-        // نفضّل السعر اللي مرتبط بـ AED / د.إ
+    const stateCandidates = [];
+    for (const x of stateObjects) {
+      walk(x.value, `page:${x.name}`, stateCandidates);
+    }
+
+    // DOM fallback: focus on blocks with quantity controls and a single product image.
+    const domProducts = await page.evaluate(() => {
+      const txt = el => (el?.innerText || "").replace(/\s+/g, " ").trim();
+
+      function getImg(el) {
+        const i = el?.querySelector("img");
+        return i?.currentSrc || i?.src || i?.getAttribute("data-src") || "";
+      }
+
+      function hasQty(el) {
+        const buttons = [...el.querySelectorAll("button")].map(b => txt(b));
+        const hasP = buttons.some(x => x.includes("+"));
+        const hasM = buttons.some(x => x.includes("-") || x.includes("−"));
+        return hasP && hasM;
+      }
+
+      function money(text) {
+        const t = text.replace(/,/g, "");
         let m = t.match(/(?:AED|د\.?\s*إ|دإ)\s*([0-9]+(?:\.[0-9]{1,2})?)/i);
-        if (m) return { amount: Number(m[1]), currency: "AED" };
+        if (m) return Number(m[1]);
 
         m = t.match(/([0-9]+(?:\.[0-9]{1,2})?)\s*(?:AED|د\.?\s*إ|دإ)/i);
-        if (m) return { amount: Number(m[1]), currency: "AED" };
-
-        // بعض صفحات الإمارات تعرض الرقم بدون رمز واضح داخل نفس الكرت.
-        const nums = [...t.matchAll(/(?:^|\s)([0-9]+(?:\.[0-9]{1,2})?)(?=\s|$)/g)]
-          .map(x => Number(x[1]))
-          .filter(n => n > 1 && n < 5000);
-
-        if (nums.length) return { amount: nums[0], currency: "AED" };
+        if (m) return Number(m[1]);
 
         return null;
       }
 
-      function looksLikeQtyControl(el) {
-        const text = txt(el);
-        const buttons = [...el.querySelectorAll("button")].map(b => txt(b));
-        const labels = buttons.join(" | ");
-
-        const hasPlus =
-          buttons.some(x => x === "+" || x.includes("+")) ||
-          /increase|add/i.test(labels);
-
-        const hasMinus =
-          buttons.some(x => x === "-" || x === "−" || x.includes("−")) ||
-          /decrease|minus/i.test(labels);
-
-        const hasQtyWord = /qty|quantity|الكمية|عدد/i.test(text);
-
-        return (hasPlus && hasMinus) || (hasQtyWord && (hasPlus || hasMinus));
-      }
-
-      // نبدأ من العناصر اللي فعلاً بيها تحكم كمية.
-      const all = [...document.querySelectorAll("body *")];
-      const qtyNodes = all.filter(el => looksLikeQtyControl(el));
-
+      const qNodes = [...document.querySelectorAll("body *")].filter(hasQty);
       const cards = [];
-      const seenNodes = new Set();
 
-      for (const q of qtyNodes) {
+      for (const q of qNodes) {
         let el = q;
-
-        // نصعد للأب لحد ما نلقى كرت مع صورة وسعر، بس ما نطلع بعيد.
-        for (let i = 0; i < 7 && el; i++, el = el.parentElement) {
-          if (seenNodes.has(el)) continue;
-
+        for (let i = 0; i < 6 && el; i++, el = el.parentElement) {
           const text = txt(el);
-          const image = getImage(el);
-          const money = parseMoney(text);
+          const img = getImg(el);
+          const price = money(text);
 
           if (
-            image &&
-            money &&
-            text.length >= 12 &&
-            text.length <= 1200 &&
-            el.querySelectorAll("img").length <= 4
+            img &&
+            price &&
+            text.length >= 10 &&
+            text.length <= 1000 &&
+            el.querySelectorAll("img").length <= 3
           ) {
-            seenNodes.add(el);
-            cards.push({ el, text, image, money });
+            const lines = (el.innerText || "")
+              .split("\n")
+              .map(x => x.replace(/\s+/g," ").trim())
+              .filter(Boolean);
+
+            const name = lines.find(line =>
+              line.length >= 5 &&
+              line.length <= 220 &&
+              !/^(AED|د\.?\s*إ|دإ)?\s*\d/.test(line) &&
+              !/^(qty|quantity|الكمية|حذف|remove|delete|خصم|عرض|shipping|شحن)/i.test(line)
+            );
+
+            if (name) cards.push({ name, price, img });
             break;
           }
         }
       }
 
-      // شيل الكروت المتداخلة: إذا واحد أب لكرت أصغر، نحتفظ بالأصغر.
-      const minimal = cards.filter((c, i) => {
-        return !cards.some((d, j) =>
-          i !== j &&
-          c.el.contains(d.el) &&
-          c.el !== d.el
-        );
-      });
-
-      const result = [];
-
-      for (const c of minimal) {
-        const text = c.text;
-        const lines = (c.el.innerText || "")
-          .split("\n")
-          .map(x => x.replace(/\s+/g, " ").trim())
-          .filter(Boolean);
-
-        const badLine = /^(AED|د\.?\s*إ|دإ)?\s*[0-9]+(?:\.[0-9]{1,2})?\s*(AED|د\.?\s*إ|دإ)?$/i;
-
-        const name = lines.find(line =>
-          line.length >= 5 &&
-          line.length <= 220 &&
-          !badLine.test(line) &&
-          !/^(qty|quantity|الكمية|عدد|remove|delete|حذف|save|خصم|عرض|شحن|shipping)/i.test(line) &&
-          !/^[+\-−0-9\s.]+$/.test(line)
-        ) || "منتج SHEIN";
-
-        let qty = 1;
-
-        // نحاول نلقط الرقم الظاهر بين + و -
-        const qText = txt(c.el);
-        const qMatch =
-          qText.match(/(?:^|\s)[−-]\s*([0-9]{1,2})\s*\+(?:\s|$)/) ||
-          qText.match(/(?:^|\s)\+\s*([0-9]{1,2})\s*[−-](?:\s|$)/);
-
-        if (qMatch) qty = Math.max(1, Number(qMatch[1]) || 1);
-
-        result.push({
-          name,
-          aed: c.money.amount,
-          qty,
-          img: c.image
-        });
-      }
-
-      // إزالة التكرار الحقيقي فقط.
-      const deduped = [];
       const seen = new Set();
+      return cards.filter(p => {
+        const k = `${p.name}|${p.price}|${p.img}`;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+    }).catch(() => []);
 
-      for (const p of result) {
-        const key = `${p.name}|${p.aed}|${p.img}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        deduped.push(p);
-      }
+    let candidates = dedupeCandidates([
+      ...networkCandidates,
+      ...stateCandidates
+    ]);
 
-      // نحاول نقرأ عدد منتجات السلة من النص، وإذا وجدناه نستخدمه كحد أقصى.
-      const bodyText = txt(document.body);
-      const countPatterns = [
-        /(?:cart|bag|السلة)[^\d]{0,20}([0-9]{1,2})\s*(?:items?|منتج|قطعة)/i,
-        /([0-9]{1,2})\s*(?:items?|منتج|قطعة)[^\n]{0,20}(?:cart|bag|السلة)/i
+    // Prefer only candidates strongly tied to cart structures.
+    let strong = candidates.filter(c => score(c) >= 8);
+
+    // If network/state gave nothing reliable, use DOM fallback.
+    let finalProducts = strong.length ? strong : domProducts.map(p => ({
+      name:p.name,
+      price:p.price,
+      qty:1,
+      img:p.img,
+      variant:"",
+      sourcePath:"dom",
+      cartish:true
+    }));
+
+    // Detect count from page text; user's test cart has 2 items, this keeps extras out.
+    const detectedCount = await page.evaluate(() => {
+      const t = (document.body?.innerText || "").replace(/\s+/g," ");
+
+      const patterns = [
+        /(?:السلة|cart|bag)[^0-9]{0,30}([0-9]{1,2})\s*(?:قطعة|منتج|items?)/i,
+        /([0-9]{1,2})\s*(?:قطعة|منتج|items?)[^0-9]{0,30}(?:السلة|cart|bag)/i
       ];
 
-      let expectedCount = null;
-      for (const re of countPatterns) {
-        const m = bodyText.match(re);
+      for (const re of patterns) {
+        const m = t.match(re);
         if (m) {
           const n = Number(m[1]);
-          if (n > 0 && n <= 100) {
-            expectedCount = n;
-            break;
-          }
+          if (n >= 1 && n <= 100) return n;
         }
       }
 
-      return {
-        products: expectedCount ? deduped.slice(0, expectedCount) : deduped,
-        expectedCount,
-        finalUrl: location.href
-      };
-    });
+      return null;
+    }).catch(() => null);
 
-    const products = (raw.products || [])
-      .filter(p =>
-        p &&
-        p.name &&
-        Number.isFinite(Number(p.aed)) &&
-        Number(p.aed) > 0.5 &&
-        Number(p.aed) < 5000
-      )
+    if (detectedCount && finalProducts.length > detectedCount) {
+      finalProducts = finalProducts.slice(0, detectedCount);
+    }
+
+    // Last safeguard: keep only the top cart-like items if there are obvious recommendation floods.
+    if (!detectedCount && finalProducts.length > 8) {
+      finalProducts = finalProducts.slice(0, 8);
+    }
+
+    const products = finalProducts
+      .filter(p => p.name && p.price > 0.5 && p.price < 5000)
       .map(p => ({
-        name: cleanText(p.name),
-        usd: aedToUsd(Number(p.aed)),
-        aed: Number(p.aed),
+        name: clean(p.name),
+        usd: priceToUsd(Number(p.price), "AED"),
+        aed: Number(p.price),
         qty: Math.max(1, Number(p.qty) || 1),
         img: p.img || "",
-        variant: ""
+        variant: p.variant || ""
       }));
 
     return {
-      finalUrl: raw.finalUrl || page.url(),
-      expectedCount: raw.expectedCount || null,
+      url: page.url(),
+      detectedCount,
       products
     };
   } finally {
@@ -288,58 +449,56 @@ app.post("/api/cart", async (req, res) => {
 
     if (!url || !allowed(url)) {
       return res.status(400).json({
-        error: "الصقي رابط SHEIN فقط بدون النص الطويل."
+        error: "الصقي رابط SHEIN فقط."
       });
     }
 
     const cached = cache.get(url);
-    if (cached && Date.now() - cached.time < 10 * 60 * 1000) {
+    if (cached && Date.now() - cached.time < 5 * 60 * 1000) {
       return res.json(cached.data);
     }
 
-    const result = await scrapeCart(url);
+    const result = await scrape(url);
 
     if (!result.products.length) {
       return res.status(422).json({
         error:
-          "فتحنا السلة بس ما قدرنا نحدد كروت المنتجات الحقيقية. جرّبي رابط مشاركة جديد من داخل السلة."
+          "فتحنا رابط السلة، بس SHEIN ما رجّع بيانات منتجات كافية. جرّبي نفس الرابط مرة ثانية."
       });
     }
 
     const data = {
-      url: result.finalUrl,
-      products: result.products,
-      detectedCount: result.expectedCount
+      url: result.url,
+      detectedCount: result.detectedCount,
+      products: result.products
     };
 
     cache.set(url, { time: Date.now(), data });
     res.json(data);
   } catch (err) {
-    console.error("Cart scrape error:", err);
+    console.error(err);
 
-    const msg = String(err?.message || "");
+    const m = String(err?.message || "");
 
-    if (msg.includes("Executable doesn't exist")) {
+    if (m.includes("Executable doesn't exist")) {
       return res.status(500).json({
-        error: "Chromium مو مثبت أو مساره مو مضبوط على Render."
+        error: "Chromium مو مضبوط على Render."
       });
     }
 
-    if (msg.includes("Timeout")) {
+    if (m.includes("Timeout")) {
       return res.status(504).json({
         error: "SHEIN أخذ وقت أطول من اللازم. جرّبي مرة ثانية."
       });
     }
 
-    return res.status(500).json({
-      error: "صار خطأ أثناء قراءة سلة SHEIN."
+    res.status(500).json({
+      error: "صار خطأ أثناء قراءة السلة."
     });
   }
 });
 
-app.get("/health", (req, res) => res.json({ ok: true }));
+app.get("/health", (req,res) => res.json({ ok:true }));
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log("SHEIN Ano strict-cart reader running on", port);
-});
+app.listen(port, () => console.log("SHEIN Ano cart reader v3 running on", port));
