@@ -3,6 +3,6 @@ services:
     name: shein-ano
     runtime: node
     plan: free
-    buildCommand: npm install
+    buildCommand: npm install && npx playwright install chromium
     startCommand: npm start
     healthCheckPath: /health
